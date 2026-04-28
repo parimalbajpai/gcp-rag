@@ -1,1 +1,2 @@
-Hello world!
+With a lot of help from Claude
+Not checking in 00-config.sh
