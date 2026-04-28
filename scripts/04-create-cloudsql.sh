@@ -43,38 +43,92 @@ echo "==> Database:   $DB_NAME"
 echo "==> App user:   $DB_USER"
 echo
 
-gcloud config set project "$GCP_PROJECT_ID" >/dev/null
+gcloud config set project "$GCP_PROJECT_ID" 
 
 # ---------- helpers -----------------------------------------------------
 gen_password() {
-  # 32 url-safe-ish random chars, no padding/equals/slashes that complicate URIs.
-  LC_ALL=C tr -dc 'A-Za-z0-9_-' </dev/urandom | head -c 32
+  # 32 random base64-ish chars, SIGPIPE-safe (no infinite stream piped to head).
+  # Reads a finite 64 random bytes, base64-encodes (~88 chars), strips
+  # url-unsafe punctuation, then takes the first 32 via bash substring.
+  local chars
+  chars="$(LC_ALL=C dd if=/dev/urandom bs=64 count=1 2>/dev/null | base64 | tr -d '/+=\n')"
+  if [[ ${#chars} -lt 32 ]]; then
+    echo "ERROR: gen_password got only ${#chars} usable chars, expected >=32" >&2
+    return 1
+  fi
+  printf '%s' "${chars:0:32}"
 }
 
 ensure_secret_with_password() {
   # Args: secret_name
-  # Creates the secret if missing, generates a fresh password, adds it as
-  # version 1. If the secret already exists, leaves it alone.
+  # Idempotent in two dimensions:
+  #   - creates the secret if missing
+  #   - ensures the secret has at least one accessible version (handles the
+  #     case where a previous run created the secret but failed before adding
+  #     a version, leaving 'describe' succeeding but 'access' failing).
+  #
+  # Uses explicit error checks throughout instead of relying on `set -e`
+  # propagation, which is unreliable in bash 3.2 (default on macOS) when the
+  # failing command sits inside a function called as a simple statement.
   local name="$1"
+
+  # Step 1: ensure the secret resource exists.
   if gcloud secrets describe "$name" >/dev/null 2>&1; then
-    echo "   - secret '$name' exists, reusing."
+    echo "   - secret '$name' exists."
   else
-    echo "   - creating secret '$name' and generating password..."
-    gcloud secrets create "$name" --replication-policy="automatic" >/dev/null
-    local pw; pw="$(gen_password)"
-    printf '%s' "$pw" | gcloud secrets versions add "$name" --data-file=- >/dev/null
+    echo "   - creating secret '$name'..."
+    if ! gcloud secrets create "$name" --replication-policy="automatic"; then
+      echo "ERROR: failed to create secret '$name'." >&2
+      return 1
+    fi
+  fi
+
+  # Step 2: ensure the secret has at least one accessible version.
+  # Using `access latest` as the probe avoids the filter-warning noise and
+  # tests exactly what the rest of the script depends on.
+  if gcloud secrets versions access latest --secret="$name" >/dev/null 2>&1; then
+    echo "   - '$name' has a usable version, reusing."
+    return 0
+  fi
+
+  echo "   - '$name' has no usable version, generating and adding one..."
+  local pw
+  if ! pw="$(gen_password)"; then
+    echo "ERROR: gen_password failed for '$name'." >&2
+    return 1
+  fi
+  if [[ -z "$pw" ]]; then
+    echo "ERROR: gen_password produced empty output for '$name'." >&2
+    return 1
+  fi
+  if ! printf '%s' "$pw" | gcloud secrets versions add "$name" --data-file=-; then
+    echo "ERROR: failed to add a version to secret '$name'." >&2
+    return 1
   fi
 }
 
 read_secret() {
-  gcloud secrets versions access latest --secret="$1"
+  local name="$1"
+  if ! gcloud secrets versions access latest --secret="$name" 2>/dev/null; then
+    echo "ERROR: failed to read secret '$name'." >&2
+    echo "  Things to check:" >&2
+    echo "  - Does your gcloud account have roles/secretmanager.secretAccessor on this project?" >&2
+    echo "      gcloud projects add-iam-policy-binding $GCP_PROJECT_ID \\" >&2
+    echo "        --member=user:\$(gcloud config get-value account) \\" >&2
+    echo "        --role=roles/secretmanager.secretAccessor" >&2
+    echo "  - Is the secret actually populated? Inspect with:" >&2
+    echo "      gcloud secrets versions list $name" >&2
+    return 1
+  fi
 }
 
 # ---------- 1. passwords in Secret Manager -------------------------------
-echo "==> Secret Manager: ensuring DB passwords exist"
+echo "==> Secret Manager: ensuring DB passwords exist DB_ROOT"
 ensure_secret_with_password "$SECRET_DB_ROOT_PASSWORD"
+echo "==> Secret Manager: ensuring DB passwords exist DB_APP"
 ensure_secret_with_password "$SECRET_DB_APP_PASSWORD"
 
+echo "==> Secret Manager: reading secret"
 ROOT_PASSWORD="$(read_secret "$SECRET_DB_ROOT_PASSWORD")"
 APP_PASSWORD="$(read_secret "$SECRET_DB_APP_PASSWORD")"
 
@@ -85,7 +139,12 @@ if gcloud sql instances describe "$CLOUDSQL_INSTANCE" >/dev/null 2>&1; then
   echo "   - instance '$CLOUDSQL_INSTANCE' already exists, skipping create."
 else
   echo "   - creating instance '$CLOUDSQL_INSTANCE' (this takes 5-10 minutes)..."
+  # --edition=ENTERPRISE is required to use db-custom-* tiers. Without it,
+  # the project may default to ENTERPRISE_PLUS, which only accepts predefined
+  # db-perf-optimized-N-* tiers (much more expensive). Enterprise is correct
+  # for prototypes and small production workloads.
   gcloud sql instances create "$CLOUDSQL_INSTANCE" \
+    --edition=ENTERPRISE \
     --database-version="$CLOUDSQL_PG_VERSION" \
     --tier="$CLOUDSQL_TIER" \
     --region="$GCP_REGION" \
