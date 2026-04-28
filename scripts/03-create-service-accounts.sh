@@ -133,19 +133,24 @@ for sa in "$SA_INGESTION_EMAIL" "$SA_QUERY_EMAIL"; do
     --filter="bindings.members:${sa}"
 done
 
-echo
-echo "--- Bucket IAM: gs://${GCS_BUCKET_RAW} ---"
-gcloud storage buckets get-iam-policy "gs://${GCS_BUCKET_RAW}" \
-  --format="table(bindings.role, bindings.members)" \
-  --flatten="bindings[].members" \
-  --filter="bindings.members:${SA_INGESTION_EMAIL} OR bindings.members:${SA_QUERY_EMAIL}"
+# `gcloud storage buckets get-iam-policy` does NOT accept --flatten/--filter
+# (unlike `gcloud projects get-iam-policy`). Dump the full policy as YAML and
+# grep for our SAs — portable across gcloud versions.
+print_bucket_iam_for_sas() {
+  local bucket="$1"
+  echo
+  echo "--- Bucket IAM: gs://${bucket} (lines mentioning our SAs) ---"
+  local policy
+  policy="$(gcloud storage buckets get-iam-policy "gs://${bucket}" --format=yaml)"
+  # Show each role line and its following members block, but only SA-related members.
+  # Simple grep with context is usually enough to eyeball.
+  echo "$policy" | grep -E -B1 -A0 "(${SA_INGESTION_ID}|${SA_QUERY_ID})@" || {
+    echo "(no bindings found for ingestion-sa or query-sa on this bucket)"
+  }
+}
 
-echo
-echo "--- Bucket IAM: gs://${GCS_BUCKET_PROCESSED} ---"
-gcloud storage buckets get-iam-policy "gs://${GCS_BUCKET_PROCESSED}" \
-  --format="table(bindings.role, bindings.members)" \
-  --flatten="bindings[].members" \
-  --filter="bindings.members:${SA_INGESTION_EMAIL} OR bindings.members:${SA_QUERY_EMAIL}"
+print_bucket_iam_for_sas "$GCS_BUCKET_RAW"
+print_bucket_iam_for_sas "$GCS_BUCKET_PROCESSED"
 
 echo
 echo "Done. Next steps:"
