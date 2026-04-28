@@ -19,6 +19,14 @@
 #
 # PREREQS:
 #   - APIs enabled (run 01-enable-apis.sh).
+#   - gcloud installed from the GCP website download (NOT Homebrew):
+#       https://cloud.google.com/sdk/docs/install
+#       The official installer supports `gcloud components install`, which
+#       Homebrew-managed gcloud does not.
+#   - cloud-sql-proxy gcloud component installed:
+#       gcloud components install cloud-sql-proxy
+#       (required by `gcloud sql connect` v2; without it, the CREATE
+#       EXTENSION step at the end of this script will fail.)
 #   - psql on PATH (so `gcloud sql connect` can run the CREATE EXTENSION).
 #       macOS:  brew install libpq && brew link --force libpq
 #       Or:     brew install postgresql@16
@@ -199,28 +207,65 @@ fi
 echo
 echo "==> Installing pgvector extension"
 
-if ! command -v psql >/dev/null 2>&1; then
-  cat <<EOF
-   - psql not found on PATH. Skipping CREATE EXTENSION.
-     Install psql and re-run this script, OR run this once manually:
+print_manual_extension_instructions() {
+  cat >&2 <<EOF
 
-     PGPASSWORD='<root-pw-from-secret-manager>' \\
-       gcloud sql connect $CLOUDSQL_INSTANCE \\
-         --user=postgres --database=$DB_NAME --quiet \\
-         <<<'CREATE EXTENSION IF NOT EXISTS vector;'
+  Skipping in-script CREATE EXTENSION. The DB itself is fully provisioned.
+  Run this ONE-TIME setup yourself (any of the following works):
 
-     macOS install: brew install libpq && brew link --force libpq
+  Option A) Install the gcloud component (if you installed gcloud via the
+  official installer):
+      gcloud components install cloud-sql-proxy
+      ./04-create-cloudsql.sh   # re-run; the rest is idempotent
+
+  Option B) Homebrew-managed gcloud — install via brew:
+      brew install google-cloud-sql-proxy
+      ./04-create-cloudsql.sh
+
+  Option C) Cloud Shell (browser, no local install needed). Open Cloud Shell
+  on the project, then:
+      gcloud sql connect $CLOUDSQL_INSTANCE --user=postgres --database=$DB_NAME
+      # paste at the postgres prompt:
+      CREATE EXTENSION IF NOT EXISTS vector;
+      GRANT ALL ON SCHEMA public TO $DB_USER;
+      \\q
+
 EOF
-else
-  # gcloud sql connect auto-whitelists this machine's public IP for ~5 min.
-  echo "   - connecting via 'gcloud sql connect' and running CREATE EXTENSION..."
+}
+
+run_extension_sql() {
   PGPASSWORD="$ROOT_PASSWORD" gcloud sql connect "$CLOUDSQL_INSTANCE" \
-    --user=postgres --database="$DB_NAME" --quiet <<'SQL'
+    --user=postgres --database="$DB_NAME" --quiet <<SQL
 CREATE EXTENSION IF NOT EXISTS vector;
 -- Grant schema usage to the app user so it can create tables / use vector.
-GRANT ALL ON SCHEMA public TO ragapp;
+GRANT ALL ON SCHEMA public TO ${DB_USER};
 SELECT extname, extversion FROM pg_extension WHERE extname='vector';
 SQL
+}
+
+if ! command -v psql >/dev/null 2>&1; then
+  echo "   - psql not found on PATH (needed by 'gcloud sql connect')."
+  echo "     macOS:  brew install libpq && brew link --force libpq"
+  print_manual_extension_instructions
+else
+  echo "   - connecting via 'gcloud sql connect' and running CREATE EXTENSION..."
+  if ! run_extension_sql; then
+    echo
+    echo "   - 'gcloud sql connect' failed. Most common cause: the cloud-sql-proxy"
+    echo "     gcloud component is not installed (required for connect v2)."
+    echo "     Attempting to install it now..."
+    if gcloud components install cloud-sql-proxy --quiet 2>&1 | tee /tmp/gcc-install.log \
+         | grep -q "Update done"; then
+      echo "   - component installed; retrying CREATE EXTENSION..."
+      if ! run_extension_sql; then
+        echo "   - retry failed."
+        print_manual_extension_instructions
+      fi
+    else
+      echo "   - auto-install did not complete (often the case on Homebrew gcloud)."
+      print_manual_extension_instructions
+    fi
+  fi
 fi
 
 # ---------- summary -----------------------------------------------------
